@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """NSnip — freeze-first screenshot tool with annotations and system tray."""
 
+import importlib.metadata
 import io
+import json
 import math
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +22,7 @@ import cairo
 from PIL import Image
 
 WAYLAND = 'wayland' in os.environ.get('XDG_SESSION_TYPE', '').lower()
+_GITHUB_REPO = 'NoeGarCou/nsnip'
 
 
 # ── Annotation types ──────────────────────────────────────────────────────────
@@ -126,6 +131,263 @@ def _render_annotation(cr: cairo.Context, ann: Any):
         cr.set_font_size(ann.size)
         cr.move_to(ann.x, ann.y)
         cr.show_text(ann.text)
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_CONFIG_DIR  = os.path.expanduser('~/.config/nsnip')
+_CONFIG_FILE = os.path.join(_CONFIG_DIR, 'config.json')
+_DEFAULTS: dict = {'hotkey': '<print_screen>'}
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_FILE) as f:
+            return {**_DEFAULTS, **json.load(f)}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(_DEFAULTS)
+
+
+def _save_config(cfg: dict):
+    os.makedirs(_CONFIG_DIR, exist_ok=True)
+    with open(_CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+
+# ── Hotkey helpers ────────────────────────────────────────────────────────────
+
+_MODIFIER_KEYSYMS = frozenset({
+    Gdk.KEY_Control_L, Gdk.KEY_Control_R,
+    Gdk.KEY_Shift_L,   Gdk.KEY_Shift_R,
+    Gdk.KEY_Alt_L,     Gdk.KEY_Alt_R,
+    Gdk.KEY_Super_L,   Gdk.KEY_Super_R,
+    Gdk.KEY_Meta_L,    Gdk.KEY_Meta_R,
+    Gdk.KEY_Hyper_L,   Gdk.KEY_Hyper_R,
+    Gdk.KEY_ISO_Level3_Shift,
+})
+
+_GDK_TO_PYNPUT: dict[str, str] = {
+    'Print': 'print_screen', 'Scroll_Lock': 'scroll_lock',
+    'Num_Lock': 'num_lock',  'Pause': 'pause',
+    'Insert': 'insert',      'Delete': 'delete',
+    'Home': 'home',          'End': 'end',
+    'Page_Up': 'page_up',    'Page_Down': 'page_down',
+    'Up': 'up', 'Down': 'down', 'Left': 'left', 'Right': 'right',
+    **{f'F{i}': f'f{i}' for i in range(1, 13)},
+    'Escape': 'esc', 'Tab': 'tab', 'BackSpace': 'backspace',
+    'Return': 'enter', 'KP_Enter': 'enter', 'space': 'space',
+    'Menu': 'menu',
+}
+
+_LABEL: dict[str, str] = {
+    'print_screen': 'Print Screen', 'scroll_lock': 'Scroll Lock',
+    'num_lock': 'Num Lock',         'pause': 'Pause',
+    'insert': 'Insert',             'delete': 'Delete',
+    'home': 'Home',                 'end': 'End',
+    'page_up': 'Page Up',           'page_down': 'Page Down',
+    'up': '↑', 'down': '↓', 'left': '←', 'right': '→',
+    **{f'f{i}': f'F{i}' for i in range(1, 13)},
+    'esc': 'Esc', 'tab': 'Tab', 'backspace': 'Backspace',
+    'enter': 'Enter', 'space': 'Space', 'menu': 'Menu',
+    'ctrl': 'Ctrl', 'shift': 'Shift', 'alt': 'Alt', 'super': 'Super',
+}
+
+
+def _event_to_pynput(event) -> str | None:
+    """Convert a GTK key-press event to a pynput hotkey string, or None for bare modifiers."""
+    if event.keyval in _MODIFIER_KEYSYMS:
+        return None
+
+    mask = event.state & ~(Gdk.ModifierType.MOD2_MASK | Gdk.ModifierType.LOCK_MASK)
+    parts = []
+    if mask & Gdk.ModifierType.CONTROL_MASK: parts.append('<ctrl>')
+    if mask & Gdk.ModifierType.MOD1_MASK:    parts.append('<alt>')
+    if mask & Gdk.ModifierType.SUPER_MASK:   parts.append('<super>')
+    if mask & Gdk.ModifierType.SHIFT_MASK:   parts.append('<shift>')
+
+    key_name = Gdk.keyval_name(event.keyval)
+    pynput = _GDK_TO_PYNPUT.get(key_name)
+    if pynput:
+        parts.append(f'<{pynput}>')
+    elif len(key_name) == 1:
+        parts.append(key_name.lower())
+    else:
+        return None
+
+    return '+'.join(parts)
+
+
+def _pynput_to_label(hotkey: str) -> str:
+    labels = []
+    for part in hotkey.split('+'):
+        if part.startswith('<') and part.endswith('>'):
+            name = part[1:-1]
+            labels.append(_LABEL.get(name, name.title()))
+        else:
+            labels.append(part.upper() if len(part) == 1 else part)
+    return '+'.join(labels)
+
+
+# ── Update checking ───────────────────────────────────────────────────────────
+
+def _remote_version() -> str | None:
+    url = f'https://raw.githubusercontent.com/{_GITHUB_REPO}/main/pyproject.toml'
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            for line in r.read().decode().splitlines():
+                if line.startswith('version'):
+                    return line.split('"')[1]
+    except Exception:
+        return None
+
+
+def _local_version() -> str:
+    try:
+        return importlib.metadata.version('nsnip')
+    except importlib.metadata.PackageNotFoundError:
+        return '0.0.0'
+
+
+def _ver_tuple(v: str) -> tuple:
+    try:
+        return tuple(map(int, v.split('.')))
+    except ValueError:
+        return (0,)
+
+
+def _show_info(title: str, msg: str):
+    dlg = Gtk.MessageDialog(
+        transient_for=None, modal=False,
+        message_type=Gtk.MessageType.INFO,
+        buttons=Gtk.ButtonsType.OK,
+        text=title, secondary_text=msg,
+    )
+    dlg.run(); dlg.destroy()
+
+
+def _do_update():
+    subprocess.Popen(
+        ['notify-send', '-i', 'system-software-update', '-t', '5000',
+         'NSnip', 'Updating… will restart when done.'],
+        stderr=subprocess.DEVNULL,
+    )
+
+    def _run():
+        proc = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '--user',
+             '--break-system-packages', '--upgrade',
+             f'git+https://github.com/{_GITHUB_REPO}.git'],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            GLib.idle_add(_restart)
+        else:
+            detail = (proc.stderr or proc.stdout)[-500:]
+            GLib.idle_add(lambda: _show_info('Update failed', detail))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _restart():
+    import shutil
+    nsnip_bin = shutil.which('nsnip') or sys.argv[0]
+    try:
+        os.execv(nsnip_bin, [nsnip_bin])
+    except OSError as e:
+        _show_info('Restart failed', str(e))
+    return GLib.SOURCE_REMOVE
+
+
+def check_for_updates():
+    def _run():
+        local  = _local_version()
+        remote = _remote_version()
+
+        def _show():
+            if remote is None:
+                _show_info('Update check failed',
+                           'Could not reach GitHub. Check your connection.')
+            elif _ver_tuple(remote) > _ver_tuple(local):
+                dlg = Gtk.MessageDialog(
+                    transient_for=None, modal=False,
+                    message_type=Gtk.MessageType.QUESTION,
+                    buttons=Gtk.ButtonsType.YES_NO,
+                    text=f'Update available: {remote}',
+                    secondary_text=f'Installed: {local}\nUpdate now and restart?',
+                )
+                resp = dlg.run(); dlg.destroy()
+                if resp == Gtk.ResponseType.YES:
+                    _do_update()
+            else:
+                _show_info('NSnip is up to date',
+                           f'You are running the latest version ({local}).')
+
+        GLib.idle_add(_show)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Preferences dialog ────────────────────────────────────────────────────────
+
+class _HotkeyCaptureDialog(Gtk.Dialog):
+    def __init__(self, parent):
+        super().__init__(title='Set Shortcut', transient_for=parent, modal=True)
+        self.set_default_size(300, 90)
+        self.captured: str | None = None
+
+        lbl = Gtk.Label(label='Press a key combination…')
+        lbl.set_margin_start(16); lbl.set_margin_end(16)
+        lbl.set_margin_top(20);   lbl.set_margin_bottom(20)
+        self.get_content_area().add(lbl)
+        self.add_button('Cancel', Gtk.ResponseType.CANCEL)
+        self.show_all()
+        self.connect('key-press-event', self._on_key)
+        self.run()
+        self.destroy()
+
+    def _on_key(self, _win, event):
+        result = _event_to_pynput(event)
+        if result:
+            self.captured = result
+            self.response(Gtk.ResponseType.OK)
+
+
+class PreferencesDialog(Gtk.Dialog):
+    def __init__(self, cfg: dict, on_save):
+        super().__init__(title='NSnip Preferences', transient_for=None, modal=False)
+        self.set_default_size(340, 110)
+        self._cfg = dict(cfg)
+        self._hotkey = cfg['hotkey']
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        grid.set_margin_start(16); grid.set_margin_end(16)
+        grid.set_margin_top(14);   grid.set_margin_bottom(14)
+
+        grid.attach(Gtk.Label(label='Screenshot shortcut:', halign=Gtk.Align.START), 0, 0, 1, 1)
+
+        self._key_btn = Gtk.Button(label=_pynput_to_label(self._hotkey))
+        self._key_btn.set_tooltip_text('Click to change the shortcut')
+        self._key_btn.connect('clicked', self._on_change_key)
+        grid.attach(self._key_btn, 1, 0, 1, 1)
+
+        self.get_content_area().add(grid)
+
+        self.add_button('Cancel', Gtk.ResponseType.CANCEL)
+        save_btn = self.add_button('Save', Gtk.ResponseType.OK)
+        save_btn.get_style_context().add_class('suggested-action')
+
+        self.show_all()
+        if self.run() == Gtk.ResponseType.OK:
+            self._cfg['hotkey'] = self._hotkey
+            _save_config(self._cfg)
+            on_save(self._hotkey)
+        self.destroy()
+
+    def _on_change_key(self, _btn):
+        cap = _HotkeyCaptureDialog(self)
+        if cap.captured:
+            self._hotkey = cap.captured
+            self._key_btn.set_label(_pynput_to_label(cap.captured))
 
 
 # ── Annotation window ─────────────────────────────────────────────────────────
@@ -479,7 +741,9 @@ def _make_tray_icon() -> tuple[str, str]:
 
 
 class TrayIcon:
-    def __init__(self, on_snip, on_quit):
+    def __init__(self, on_snip, on_quit, cfg: dict, on_hotkey_change):
+        self._cfg = cfg
+        self._on_hotkey_change = on_hotkey_change
         menu = self._build_menu(on_snip, on_quit)
         theme_dir, icon_name = _make_tray_icon()
 
@@ -523,12 +787,25 @@ class TrayIcon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        item_prefs = Gtk.MenuItem(label='Preferences…')
+        item_prefs.connect('activate', lambda _: self._open_preferences())
+        menu.append(item_prefs)
+
+        item_update = Gtk.MenuItem(label='Check for Updates')
+        item_update.connect('activate', lambda _: check_for_updates())
+        menu.append(item_update)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         item_quit = Gtk.MenuItem(label='Quit')
         item_quit.connect('activate', lambda _: on_quit())
         menu.append(item_quit)
 
         menu.show_all()
         return menu
+
+    def _open_preferences(self):
+        PreferencesDialog(self._cfg, self._on_hotkey_change)
 
     def _status_icon_popup(self, icon, button, time, menu):
         menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, time)
@@ -585,25 +862,43 @@ def run_daemon():
     except ImportError:
         sys.exit('pynput not found. Run: pip install pynput')
 
-    def on_hotkey():
-        GLib.idle_add(snip)
-
-    listener = keyboard.GlobalHotKeys({'<print_screen>': on_hotkey})
-    listener.start()
-
+    cfg = _load_config()
     loop = GLib.MainLoop()
+    listener_box: list = [None]
+
+    def start_listener(hotkey: str):
+        if listener_box[0] is not None:
+            listener_box[0].stop()
+        listener_box[0] = keyboard.GlobalHotKeys(
+            {hotkey: lambda: GLib.idle_add(snip)}
+        )
+        listener_box[0].start()
+
+    def on_hotkey_change(new_hotkey: str):
+        cfg['hotkey'] = new_hotkey
+        start_listener(new_hotkey)
+        print(f'NSnip shortcut updated: {_pynput_to_label(new_hotkey)}')
 
     def on_quit():
-        listener.stop()
+        if listener_box[0]:
+            listener_box[0].stop()
         loop.quit()
 
-    tray = TrayIcon(on_snip=snip, on_quit=on_quit)  # must be stored — GC kills the indicator
+    start_listener(cfg['hotkey'])
 
-    print('NSnip running. Press Print Screen to snip.')
+    tray = TrayIcon(
+        on_snip=snip,
+        on_quit=on_quit,
+        cfg=cfg,
+        on_hotkey_change=on_hotkey_change,
+    )
+
+    print(f'NSnip running. Shortcut: {_pynput_to_label(cfg["hotkey"])}')
     try:
         loop.run()
     except KeyboardInterrupt:
-        listener.stop()
+        if listener_box[0]:
+            listener_box[0].stop()
 
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
