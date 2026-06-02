@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsnip"
+version = "0.1.0"
+description = "Freeze-first screenshot tool with annotations and system tray"
+requires-python = ">=3.10"
+dependencies = [
+    "mss>=9.0",
+    "pynput>=1.7",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+nsnip = "nsnip:main"
+nsnip-setup = "nsnip:setup"
+
+[tool.setuptools]
+py-modules = ["nsnip"]
